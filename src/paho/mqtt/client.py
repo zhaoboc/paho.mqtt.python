@@ -40,6 +40,13 @@ import hashlib
 import logging
 
 try:
+    from concurrent.futures import Future
+except ImportError:
+    HAS_FUTURE = False
+else:
+    HAS_FUTURE = True
+
+try:
     # Use monotonic clock if available
     time_func = time.monotonic
 except AttributeError:
@@ -258,14 +265,33 @@ class MQTTMessageInfo(object):
     message has been published, and/or wait until it is published.
     """
 
-    __slots__ = 'mid', '_published', '_condition', 'rc', '_iterpos'
+    __slots__ = 'mid', '_published', '_condition', 'rc', '_iterpos', 'future', 'meta'
 
-    def __init__(self, mid):
+    def __init__(self, mid, meta):
         self.mid = mid
         self._published = False
         self._condition = threading.Condition()
         self.rc = 0
         self._iterpos = 0
+        if HAS_FUTURE:
+            self.future = Future()
+        else:
+            self.future = None
+        self.meta = meta
+
+    def __getstate__(self):
+        return {'mid': self.mid, '_published': self._published, 'rc': self.rc, '_iterpos': self._iterpos,
+                'meta': self.meta}
+
+    def __setstate__(self, state):
+        self.mid = state['mid']
+        self._published = state['_published']
+        self._condition = threading.Condition()
+        self.rc = state['rc']
+        self._iterpos = state['_iterpos']
+        self.meta = state['meta']
+        if HAS_FUTURE:
+            self.future = Future()
 
     def __str__(self):
         return str((self.rc, self.mid))
@@ -299,6 +325,8 @@ class MQTTMessageInfo(object):
         with self._condition:
             self._published = True
             self._condition.notify()
+        if self.future is not None:
+            self.future.set_result((self.rc, self.meta))
 
     def wait_for_publish(self):
         """Block until the message associated with this object is published."""
@@ -334,7 +362,7 @@ class MQTTMessage(object):
 
     __slots__ = 'timestamp', 'state', 'dup', 'mid', '_topic', 'payload', 'qos', 'retain', 'info'
 
-    def __init__(self, mid=0, topic=b""):
+    def __init__(self, mid=0, topic=b"", meta=None):
         self.timestamp = 0
         self.state = mqtt_ms_invalid
         self.dup = False
@@ -343,7 +371,7 @@ class MQTTMessage(object):
         self.payload = b""
         self.qos = 0
         self.retain = False
-        self.info = MQTTMessageInfo(mid)
+        self.info = MQTTMessageInfo(mid, meta)
 
     def __eq__(self, other):
         """Override the default Equals behavior"""
@@ -569,6 +597,7 @@ class Client(object):
         self._on_publish = None
         self._on_unsubscribe = None
         self._on_disconnect = None
+        self._store = None
         self._websocket_path = "/mqtt"
         self._websocket_extra_headers = None
 
@@ -1104,7 +1133,7 @@ class Client(object):
 
         return self.loop_misc()
 
-    def publish(self, topic, payload=None, qos=0, retain=False):
+    def publish(self, topic, payload=None, qos=0, retain=False, meta=None):
         """Publish a message on a topic.
 
         This causes a message to be sent to the broker and subsequently from
@@ -1166,17 +1195,20 @@ class Client(object):
         local_mid = self._mid_generate()
 
         if qos == 0:
-            info = MQTTMessageInfo(local_mid)
+            info = MQTTMessageInfo(local_mid, meta)
             rc = self._send_publish(local_mid, topic, local_payload, qos, retain, False, info)
             info.rc = rc
             return info
         else:
-            message = MQTTMessage(local_mid, topic)
+            message = MQTTMessage(local_mid, topic, meta)
             message.timestamp = time_func()
             message.payload = local_payload
             message.qos = qos
             message.retain = retain
             message.dup = False
+
+            if self.store is not None:
+                self.store.set(str(local_mid), message)
 
             with self._out_message_mutex:
                 if self._max_queued_messages > 0 and len(self._out_messages) >= self._max_queued_messages:
@@ -1755,6 +1787,15 @@ class Client(object):
             self._on_publish = func
 
     @property
+    def store(self):
+        return self._store
+
+    @store.setter
+    def store(self, s):
+        with self._callback_mutex:
+            self._store = s
+
+    @property
     def on_unsubscribe(self):
         """If implemented, called when the broker responds to an unsubscribe
         request."""
@@ -1974,7 +2015,7 @@ class Client(object):
                         with self._callback_mutex:
                             if self.on_publish:
                                 with self._in_callback:
-                                    self.on_publish(self, self._userdata, packet['mid'])
+                                    self.on_publish(self, self._userdata, packet['mid'], packet['info'].meta)
 
                         packet['info']._set_as_published()
 
@@ -2582,8 +2623,8 @@ class Client(object):
             self._handle_on_message(message)
             return MQTT_ERR_SUCCESS
         elif message.qos == 1:
-            rc = self._send_puback(message.mid)
             self._handle_on_message(message)
+            rc = self._send_puback(message.mid)
             return rc
         elif message.qos == 2:
             rc = self._send_pubrec(message.mid)
@@ -2673,11 +2714,11 @@ class Client(object):
                     self.on_unsubscribe(self, self._userdata, mid)
         return MQTT_ERR_SUCCESS
 
-    def _do_on_publish(self, idx, mid):
+    def _do_on_publish(self, idx, mid, meta):
         with self._callback_mutex:
             if self.on_publish:
                 with self._in_callback:
-                    self.on_publish(self, self._userdata, mid)
+                    self.on_publish(self, self._userdata, mid, meta)
 
         msg = self._out_messages.pop(idx)
         if msg.qos > 0:
@@ -2696,12 +2737,15 @@ class Client(object):
         mid, = struct.unpack("!H", self._in_packet['packet'])
         self._easy_log(MQTT_LOG_DEBUG, "Received %s (Mid: %d)", cmd, mid)
 
+        if self.store is not None:
+            self.store.remove(str(mid))
+
         with self._out_message_mutex:
             for i in range(len(self._out_messages)):
                 try:
                     if self._out_messages[i].mid == mid:
                         # Only inform the client the message has been sent once.
-                        rc = self._do_on_publish(i, mid)
+                        rc = self._do_on_publish(i, mid, self._out_messages[i].info.meta)
                         return rc
                 except IndexError:
                     # Have removed item so i>count.
@@ -2752,6 +2796,24 @@ class Client(object):
 
             time.sleep(min(remaining, 1))
             remaining = target_time - time_func()
+
+    def restore_messages(self):
+        if self._store is not None:
+            keys = self._store.keys()
+            highest_mid = -1
+            self._easy_log(logging.INFO, "Restored %d messages from store.", len(keys))
+            for key in keys:
+                mid = int(key)
+                highest_mid = max(highest_mid, mid)
+                message = self._store.get(key)
+                message.state = mqtt_ms_publish
+                with self._out_message_mutex:
+                    self._out_messages.append(message)
+
+            if highest_mid > 0:
+                self._last_mid = highest_mid + 1
+                if self._last_mid == 65536:
+                    self._last_mid = 1
 
 
 # Compatibility class for easy porting from mosquitto.py.
